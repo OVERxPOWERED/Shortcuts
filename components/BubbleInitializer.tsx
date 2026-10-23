@@ -10,8 +10,10 @@ import {
 import { NativeModules, Platform, Linking, Alert } from "react-native";
 import { ShortcutsService } from "../services/ShortcutsService";
 import { Shortcut } from "../types/shortcut";
+import { HealthCheckService } from "../services/HealthCheckService";
+import { TelemetryService } from "../services/TelemetryService";
 
-const { OverlayPermissionModule } = NativeModules;
+const { OverlayPermissionModule, FloatingBubbleManager } = NativeModules;
 
 interface BubbleConfig {
   shortcuts: Shortcut[];
@@ -106,123 +108,135 @@ async function requestBubblePermission(): Promise<boolean> {
   }
 }
 
-export async function showBubble(
+async function checkBubbleConnectivity(): Promise<boolean> {
+  if (Platform.OS !== "android" || !FloatingBubbleManager) {
+    return true;
+  }
+
+  try {
+    const isConnected = await FloatingBubbleManager.isBubbleConnected?.();
+    return isConnected ?? true;
+  } catch (error) {
+    console.warn("Bubble connectivity check failed:", error);
+    return false;
+  }
+}
+
+export function useBubbleInitializer(
   bubbleVisibility: boolean,
   setBubbleVisibility: (val: boolean) => void,
   shortcuts: Shortcut[] = [],
   onShortcutExecute?: (shortcut: Shortcut) => Promise<void>
-): Promise<void> {
-  const permission = await requestBubblePermission();
-  
-  if (!permission) {
-    showErrorAlert("Overlay permission is required to show the floating bubble");
-    return;
-  }
-
-  if (!bubbleVisibility) {
-    try {
-      const executeHandler = onShortcutExecute ?? defaultShortcutExecutor;
-      await initializeBubble({ shortcuts, onShortcutExecute: executeHandler });
-      showFloatingBubble();
-      setBubbleVisibility(true);
-    } catch (error) {
-      console.error("Failed to show bubble:", error);
-      showErrorAlert("Failed to show floating bubble");
-    }
-  }
-}
-
-export function hideBubble(
-  bubbleVisibility: boolean,
-  setBubbleVisibility: (val: boolean) => void
 ): void {
-  if (bubbleVisibility) {
-    hideFloatingBubble();
-    setBubbleVisibility(false);
-  }
-}
+  const healthCheckServiceRef = useRef<HealthCheckService | null>(null);
+  const telemetryServiceRef = useRef<TelemetryService | null>(null);
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const isMountedRef = useRef(true);
 
-async function defaultShortcutExecutor(shortcut: Shortcut): Promise<void> {
-  switch (shortcut.actionType) {
-    case "APP_SHORTCUT":
-      await handleAppShortcut(shortcut);
-      break;
-    case "URL":
-      await handleUrlShortcut(shortcut);
-      break;
-    case "SYSTEM_ACTION":
-      await handleSystemAction(shortcut);
-      break;
-    case "CUSTOM":
-      await handleCustomAction(shortcut);
-      break;
-    default:
-      console.warn(`Unknown action type: ${(shortcut as any).actionType}`);
-      throw new Error(`Unknown action type: ${(shortcut as any).actionType}`);
-  }
-}
+  useEffect(() => {
+    isMountedRef.current = true;
 
-async function handleAppShortcut(shortcut: Shortcut): Promise<void> {
-  const { actionData } = shortcut;
-  
-  if (!actionData?.packageName) {
-    throw new Error("Package name is required for APP_SHORTCUT");
-  }
+    healthCheckServiceRef.current = HealthCheckService.getInstance();
+    telemetryServiceRef.current = TelemetryService.getInstance();
 
-  if (Platform.OS === "android") {
-    const { AppShortcutModule } = NativeModules;
-    if (AppShortcutModule?.launchApp) {
-      await AppShortcutModule.launchApp(actionData.packageName, actionData.className);
-    } else {
-      await Linking.openURL(`intent://#Intent;package=${actionData.packageName};end`);
+    const healthCheckService = healthCheckServiceRef.current;
+    const telemetryService = telemetryServiceRef.current;
+
+    const handleReport = (report: any) => {
+      if (!isMountedRef.current) return;
+      
+      telemetryService.trackPerformance("health_check_report", {
+        timestamp: report.timestamp,
+        checks: report.results.map((r: any) => ({
+          name: r.name,
+          status: r.status,
+          latencyMs: r.latencyMs,
+          details: r.details,
+        })),
+        overallStatus: report.overallStatus,
+      });
+    };
+
+    const handleError = (error: Error, context?: string) => {
+      if (!isMountedRef.current) return;
+      
+      telemetryService.trackError(error, {
+        context: context ?? "health_check",
+        timestamp: Date.now(),
+      });
+    };
+
+    healthCheckService.onReport(handleReport);
+    healthCheckService.onError(handleError);
+
+    const startPeriodicHealthChecks = async () => {
+      const runChecks = async () => {
+        if (!isMountedRef.current) return;
+
+        try {
+          const bubbleConnected = await checkBubbleConnectivity();
+          
+          await healthCheckService.runChecks({
+            checks: ["storage", "shortcuts", "bubble", "performance"],
+            bubbleConnectivity: bubbleConnected,
+            shortcutCount: shortcuts.length,
+          });
+        } catch (error) {
+          handleError(error as Error, "periodic_health_check");
+        }
+      };
+
+      await runChecks();
+      
+      intervalRef.current = setInterval(runChecks, 60_000);
+    };
+
+    startPeriodicHealthChecks();
+
+    return () => {
+      isMountedRef.current = false;
+      
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+
+      if (healthCheckServiceRef.current) {
+        healthCheckServiceRef.current.offReport(handleReport);
+        healthCheckServiceRef.current.offError(handleError);
+      }
+    };
+  }, [shortcuts.length]);
+
+  const showBubbleHandler = useCallback(async () => {
+    const permission = await requestBubblePermission();
+    
+    if (!permission) {
+      showErrorAlert("Overlay permission is required to show the floating bubble");
+      return;
     }
-  } else {
-    if (actionData.urlScheme) {
-      await Linking.openURL(actionData.urlScheme);
-    } else {
-      throw new Error("URL scheme required for iOS app shortcuts");
+
+    if (!bubbleVisibility) {
+      try {
+        const executeHandler = onShortcutExecute ?? defaultShortcutExecutor;
+        await initializeBubble({ shortcuts, onShortcutExecute: executeHandler });
+        showFloatingBubble();
+        setBubbleVisibility(true);
+      } catch (error) {
+        console.error("Failed to show bubble:", error);
+        showErrorAlert("Failed to show floating bubble");
+      }
     }
-  }
-}
+  }, [bubbleVisibility, shortcuts, onShortcutExecute, setBubbleVisibility]);
 
-async function handleUrlShortcut(shortcut: Shortcut): Promise<void> {
-  const { actionData } = shortcut;
-  
-  if (!actionData?.url) {
-    throw new Error("URL is required for URL shortcut");
-  }
-
-  const supported = await Linking.canOpenURL(actionData.url);
-  if (!supported) {
-    throw new Error(`Cannot open URL: ${actionData.url}`);
-  }
-
-  await Linking.openURL(actionData.url);
-}
-
-async function handleSystemAction(shortcut: Shortcut): Promise<void> {
-  const { actionData } = shortcut;
-  
-  if (!actionData?.systemAction) {
-    throw new Error("System action is required for SYSTEM_ACTION");
-  }
-
-  if (Platform.OS === "android") {
-    const { SystemActionModule } = NativeModules;
-    if (SystemActionModule?.executeAction) {
-      await SystemActionModule.executeAction(actionData.systemAction, actionData.extras);
-    } else {
-      await executeSystemActionViaIntent(actionData.systemAction, actionData.extras);
+  const hideBubbleHandler = useCallback(() => {
+    if (bubbleVisibility) {
+      hideFloatingBubble();
+      setBubbleVisibility(false);
     }
-  } else {
-    await executeSystemActionIOS(actionData.systemAction);
-  }
+  }, [bubbleVisibility, setBubbleVisibility]);
+
+  return { showBubble: showBubbleHandler, hideBubble: hideBubbleHandler };
 }
 
-async function executeSystemActionViaIntent(action: string, extras?: Record<string, any>): Promise<void> {
-  const intentMap: Record<string, string> = {
-    SETTINGS: "android.settings.SETTINGS",
-    WIFI_SETTINGS: "android.settings.WIFI_SETTINGS",
-    BLUETOOTH_SETTINGS: "android.settings.BLUETOOTH_SETTINGS",
-    LOCATION_SETTINGS: "android.settings.LOCATION_SOURCE_SETTINGS",
-    DISPLAY_SETTINGS: "android.settings.DISPLAY_SETTINGS
+async function defaultShortcutExecutor(shortcut: Shortcut): Promise<void>

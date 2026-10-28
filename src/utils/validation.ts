@@ -110,59 +110,113 @@ const userPreferencesSchema: z.ZodSchema<UserPreferences> = z.object({
     crashReportingEnabled: z.boolean().default(true),
     dataCollectionConsent: z.boolean().default(false),
   }).default({ analyticsEnabled: false, crashReportingEnabled: true, dataCollectionConsent: false }),
-  version: z.number().int().positive().default(1),
 }).strict();
 
-export function validateShortcut(data: unknown): Shortcut {
-  const result = shortcutSchema.safeParse(data);
+export function validateAndSanitize<T>(schema: z.ZodSchema<T>, data: unknown): T {
+  const result = schema.safeParse(data);
+  
   if (!result.success) {
-    throw ValidationError.fromZodError(result.error, 'shortcut');
+    throw ValidationError.fromZodError(result.error);
   }
+  
   return result.data;
 }
 
-export function validateShortcuts(data: unknown): Shortcut[] {
-  const arraySchema = z.array(shortcutSchema).max(20);
-  const result = arraySchema.safeParse(data);
-  if (!result.success) {
-    throw ValidationError.fromZodError(result.error, 'shortcuts');
+export function sanitizeString(
+  input: string,
+  options: { maxLength?: number; allowHtml?: boolean } = {}
+): string {
+  const { maxLength = 10000, allowHtml = false } = options;
+  
+  let sanitized = input;
+  
+  if (!allowHtml) {
+    sanitized = sanitized
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#x27;')
+      .replace(/\//g, '&#x2F;');
   }
-  return result.data;
+  
+  sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+  
+  if (sanitized.length > maxLength) {
+    sanitized = sanitized.slice(0, maxLength);
+  }
+  
+  return sanitized.trim();
 }
 
-export function validateBubbleConfig(data: unknown): BubbleConfig {
-  const result = bubbleConfigSchema.safeParse(data);
-  if (!result.success) {
-    throw ValidationError.fromZodError(result.error, 'bubbleConfig');
+function sanitizeValue(value: unknown, schema: z.ZodSchema): unknown {
+  if (value === null || value === undefined) {
+    return value;
   }
-  return result.data;
+  
+  if (typeof value === 'string') {
+    return sanitizeString(value);
+  }
+  
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+  
+  if (Array.isArray(value)) {
+    return value.map(item => sanitizeValue(item, schema));
+  }
+  
+  if (typeof value === 'object') {
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      const sanitizedKey = sanitizeString(key, { maxLength: 100, allowHtml: false });
+      sanitized[sanitizedKey] = sanitizeValue(val, schema);
+    }
+    return sanitized;
+  }
+  
+  return value;
 }
 
-export function validateUserPreferences(data: unknown): UserPreferences {
-  const result = userPreferencesSchema.safeParse(data);
-  if (!result.success) {
-    throw ValidationError.fromZodError(result.error, 'userPreferences');
-  }
-  return result.data;
+export function sanitizeObject<T>(obj: T, schema: z.ZodSchema<T>): T {
+  const sanitized = sanitizeValue(obj, schema) as T;
+  return validateAndSanitize(schema, sanitized);
 }
 
-export function safeValidateShortcut(data: unknown): { success: true; data: Shortcut } | { success: false; error: ValidationError } {
-  const result = shortcutSchema.safeParse(data);
-  if (!result.success) {
-    return { success: false, error: ValidationError.fromZodError(result.error, 'shortcut') };
-  }
-  return { success: true, data: result.data };
+export function isValidShortcut(data: unknown): data is Shortcut {
+  return shortcutSchema.safeParse(data).success;
 }
 
-export function safeValidateBubbleConfig(data: unknown): { success: true; data: BubbleConfig } | { success: false; error: ValidationError } {
-  const result = bubbleConfigSchema.safeParse(data);
-  if (!result.success) {
-    return { success: false, error: ValidationError.fromZodError(result.error, 'bubbleConfig') };
-  }
-  return { success: true, data: result.data };
+export function isValidBubbleConfig(data: unknown): data is BubbleConfig {
+  return bubbleConfigSchema.safeParse(data).success;
 }
 
-export function safeValidateUserPreferences(data: unknown): { success: true; data: UserPreferences } | { success: false; error: ValidationError } {
-  const result = userPreferencesSchema.safeParse(data);
-  if (!result.success) {
-    return { success
+export function isValidUserPreferences(data: unknown): data is UserPreferences {
+  return userPreferencesSchema.safeParse(data).success;
+}
+
+export function isValidShortcutAction(data: unknown): data is ShortcutAction {
+  return shortcutActionSchema.safeParse(data).success;
+}
+
+export function isValidBubblePosition(data: unknown): data is BubblePosition {
+  return bubblePositionSchema.safeParse(data).success;
+}
+
+export function isValidBubbleSize(data: unknown): data is BubbleSize {
+  return bubbleSizeSchema.safeParse(data).success;
+}
+
+export function isValidThemeMode(data: unknown): data is ThemeMode {
+  return themeModeSchema.safeParse(data).success;
+}
+
+export {
+  shortcutSchema,
+  bubbleConfigSchema,
+  userPreferencesSchema,
+  shortcutActionSchema,
+  bubblePositionSchema,
+  bubbleSizeSchema,
+  themeModeSchema,
+};

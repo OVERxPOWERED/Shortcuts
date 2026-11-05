@@ -2,18 +2,16 @@ import { jest } from '@jest/globals';
 import { NativeModules } from 'react-native';
 
 // Mock react-native-mmkv
-jest.mock('react-native-mmkv', () => {
-  const mockStorage = new Map<string, string>();
-  return {
-    MMKV: jest.fn().mockImplementation(() => ({
-      getString: jest.fn((key: string) => mockStorage.get(key) ?? undefined),
-      set: jest.fn((key: string, value: string) => { mockStorage.set(key, value); }),
-      delete: jest.fn((key: string) => { mockStorage.delete(key); }),
-      clearAll: jest.fn(() => { mockStorage.clear(); }),
-      getAllKeys: jest.fn(() => Array.from(mockStorage.keys())),
-    })),
-  };
-});
+const mockStorage = new Map<string, string>();
+jest.mock('react-native-mmkv', () => ({
+  MMKV: jest.fn().mockImplementation(() => ({
+    getString: jest.fn((key: string) => mockStorage.get(key) ?? undefined),
+    set: jest.fn((key: string, value: string) => { mockStorage.set(key, value); }),
+    delete: jest.fn((key: string) => { mockStorage.delete(key); }),
+    clearAll: jest.fn(() => { mockStorage.clear(); }),
+    getAllKeys: jest.fn(() => Array.from(mockStorage.keys())),
+  })),
+}));
 
 // Mock react-native-floating-bubble
 jest.mock('react-native-floating-bubble', () => ({
@@ -40,7 +38,7 @@ NativeModules.HealthCheckModule = mockHealthCheckModule;
 
 // Import after mocks
 import { HealthCheckService } from '../../src/services/HealthCheckService';
-import { SystemHealthReport, HealthCheckName, HealthCheckResult } from '../../src/types/health';
+import { SystemHealthReport, HealthCheckName, HealthCheckResult, HealthStatus } from '../../src/types/health';
 
 describe('HealthCheckService Integration Tests', () => {
   let service: HealthCheckService;
@@ -50,6 +48,7 @@ describe('HealthCheckService Integration Tests', () => {
   beforeEach(() => {
     jest.useFakeTimers();
     jest.clearAllMocks();
+    mockStorage.clear();
     
     onReportMock = jest.fn();
     onErrorMock = jest.fn();
@@ -110,300 +109,284 @@ describe('HealthCheckService Integration Tests', () => {
       expect(onReportMock).toHaveBeenCalledTimes(1);
     });
 
-    it('should not start duplicate intervals if already running', async () => {
+    it('should not start duplicate periodic checks', async () => {
       await service.startPeriodicChecks();
-      await service.startPeriodicChecks(); // Call again
+      await service.startPeriodicChecks(); // Second call should be no-op
       
       jest.advanceTimersByTime(30000);
       await Promise.resolve();
       
-      // Should only have run twice (initial + one interval), not 3 times
-      expect(onReportMock).toHaveBeenCalledTimes(2);
+      expect(onReportMock).toHaveBeenCalledTimes(2); // Only initial + one interval
+    });
+  });
+
+  describe('Native Module Failure Recovery', () => {
+    it('should gracefully degrade when storage check throws', async () => {
+      mockHealthCheckModule.runStorageCheck.mockRejectedValueOnce(new Error('Native module unavailable'));
+      
+      await service.startPeriodicChecks();
+      
+      const report = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      expect(report.checks.storage.status).toBe(HealthStatus.UNHEALTHY);
+      expect(report.checks.storage.error).toContain('Native module unavailable');
+      expect(report.overallStatus).toBe(HealthStatus.DEGRADED);
     });
 
-    it('should handle rapid start/stop cycles', async () => {
-      for (let i = 0; i < 5; i++) {
-        await service.startPeriodicChecks();
-        service.stopPeriodicChecks();
-      }
+    it('should gracefully degrade when shortcuts check throws', async () => {
+      mockHealthCheckModule.runShortcutsCheck.mockRejectedValueOnce(new Error('Shortcuts permission denied'));
       
-      // Should not throw and should be in stopped state
+      await service.startPeriodicChecks();
+      
+      const report = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      expect(report.checks.shortcuts.status).toBe(HealthStatus.UNHEALTHY);
+      expect(report.overallStatus).toBe(HealthStatus.DEGRADED);
+    });
+
+    it('should gracefully degrade when bubble check throws', async () => {
+      mockHealthCheckModule.runBubbleCheck.mockRejectedValueOnce(new Error('Bubble permission revoked'));
+      
+      await service.startPeriodicChecks();
+      
+      const report = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      expect(report.checks.bubble.status).toBe(HealthStatus.UNHEALTHY);
+      expect(report.overallStatus).toBe(HealthStatus.DEGRADED);
+    });
+
+    it('should gracefully degrade when performance check throws', async () => {
+      mockHealthCheckModule.runPerformanceCheck.mockRejectedValueOnce(new Error('Performance monitor crashed'));
+      
+      await service.startPeriodicChecks();
+      
+      const report = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      expect(report.checks.performance.status).toBe(HealthStatus.UNHEALTHY);
+      expect(report.overallStatus).toBe(HealthStatus.DEGRADED);
+    });
+
+    it('should recover when native module succeeds after failure', async () => {
+      // First check fails
+      mockHealthCheckModule.runStorageCheck.mockRejectedValueOnce(new Error('Temporary failure'));
+      await service.startPeriodicChecks();
+      
+      let report = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      expect(report.checks.storage.status).toBe(HealthStatus.UNHEALTHY);
+      
+      // Second check succeeds
+      mockHealthCheckModule.runStorageCheck.mockResolvedValueOnce({ 
+        available: true, 
+        freeSpace: 1024 * 1024 * 500, 
+        totalSpace: 1024 * 1024 * 1024 
+      });
+      
       jest.advanceTimersByTime(30000);
       await Promise.resolve();
       
-      expect(onReportMock).toHaveBeenCalledTimes(5); // Each start runs once
-    });
-  });
-
-  describe('runChecks() Report Generation', () => {
-    it('should return SystemHealthReport with all metrics', async () => {
-      const report = await service.runChecks();
-      
-      expect(report).toBeDefined();
-      expect(report.timestamp).toBeInstanceOf(Date);
-      expect(report.deviceId).toBe('test-device');
-      expect(report.platform).toBe('ios');
-      expect(report.version).toBe('17.0');
-      
-      // Verify all check categories present
-      expect(report.checks.storage).toBeDefined();
-      expect(report.checks.shortcuts).toBeDefined();
-      expect(report.checks.bubble).toBeDefined();
-      expect(report.checks.performance).toBeDefined();
+      report = onReportMock.mock.calls[1][0] as SystemHealthReport;
+      expect(report.checks.storage.status).toBe(HealthStatus.HEALTHY);
+      expect(report.overallStatus).toBe(HealthStatus.HEALTHY);
     });
 
-    it('should include storage check with correct structure', async () => {
-      const report = await service.runChecks();
-      const storage = report.checks.storage;
+    it('should call onError callback when native module throws', async () => {
+      const error = new Error('Critical native failure');
+      mockHealthCheckModule.runStorageCheck.mockRejectedValueOnce(error);
       
-      expect(storage.name).toBe(HealthCheckName.STORAGE);
-      expect(storage.status).toBe('healthy');
-      expect(storage.details).toBeDefined();
-      expect(storage.details.available).toBe(true);
-      expect(storage.details.freeSpace).toBe(1024 * 1024 * 500);
-      expect(storage.details.totalSpace).toBe(1024 * 1024 * 1024);
-      expect(storage.durationMs).toBeGreaterThanOrEqual(0);
-    });
-
-    it('should include shortcuts check with correct structure', async () => {
-      const report = await service.runChecks();
-      const shortcuts = report.checks.shortcuts;
-      
-      expect(shortcuts.name).toBe(HealthCheckName.SHORTCUTS);
-      expect(shortcuts.status).toBe('healthy');
-      expect(shortcuts.details).toBeDefined();
-      expect(shortcuts.details.available).toBe(true);
-      expect(shortcuts.details.count).toBe(5);
-      expect(shortcuts.durationMs).toBeGreaterThanOrEqual(0);
-    });
-
-    it('should include bubble check with correct structure', async () => {
-      const report = await service.runChecks();
-      const bubble = report.checks.bubble;
-      
-      expect(bubble.name).toBe(HealthCheckName.BUBBLE);
-      expect(bubble.status).toBe('healthy');
-      expect(bubble.details).toBeDefined();
-      expect(bubble.details.available).toBe(true);
-      expect(bubble.details.permissionGranted).toBe(true);
-      expect(bubble.details.position).toEqual({ x: 100, y: 100 });
-      expect(bubble.durationMs).toBeGreaterThanOrEqual(0);
-    });
-
-    it('should include performance check with correct structure', async () => {
-      const report = await service.runChecks();
-      const performance = report.checks.performance;
-      
-      expect(performance.name).toBe(HealthCheckName.PERFORMANCE);
-      expect(performance.status).toBe('healthy');
-      expect(performance.details).toBeDefined();
-      expect(performance.details.available).toBe(true);
-      expect(performance.details.memoryUsage).toBe(45);
-      expect(performance.details.cpuUsage).toBe(12);
-      expect(performance.details.fps).toBe(58);
-      expect(performance.durationMs).toBeGreaterThanOrEqual(0);
-    });
-
-    it('should fire onReport callback with generated report', async () => {
-      await service.runChecks();
-      
-      expect(onReportMock).toHaveBeenCalledTimes(1);
-      const callbackReport = onReportMock.mock.calls[0][0] as SystemHealthReport;
-      expect(callbackReport).toEqual(expect.objectContaining({
-        timestamp: expect.any(Date),
-        checks: expect.objectContaining({
-          storage: expect.any(Object),
-          shortcuts: expect.any(Object),
-          bubble: expect.any(Object),
-          performance: expect.any(Object),
-        }),
-      }));
-    });
-
-    it('should calculate overall status as healthy when all checks pass', async () => {
-      const report = await service.runChecks();
-      expect(report.overallStatus).toBe('healthy');
-    });
-
-    it('should calculate overall status as degraded when any check is degraded', async () => {
-      mockHealthCheckModule.runStorageCheck.mockResolvedValueOnce({
-        available: true,
-        freeSpace: 1024 * 1024 * 50, // Low space
-        totalSpace: 1024 * 1024 * 1024,
-      });
-      
-      const report = await service.runChecks();
-      expect(report.overallStatus).toBe('degraded');
-    });
-
-    it('should calculate overall status as critical when any check fails', async () => {
-      mockHealthCheckModule.runStorageCheck.mockResolvedValueOnce({
-        available: false,
-        freeSpace: 0,
-        totalSpace: 1024 * 1024 * 1024,
-      });
-      
-      const report = await service.runChecks();
-      expect(report.overallStatus).toBe('critical');
-    });
-  });
-
-  describe('Native Module Interaction', () => {
-    it('should call all native module methods during runChecks', async () => {
-      await service.runChecks();
-      
-      expect(mockHealthCheckModule.runStorageCheck).toHaveBeenCalledTimes(1);
-      expect(mockHealthCheckModule.runShortcutsCheck).toHaveBeenCalledTimes(1);
-      expect(mockHealthCheckModule.runBubbleCheck).toHaveBeenCalledTimes(1);
-      expect(mockHealthCheckModule.runPerformanceCheck).toHaveBeenCalledTimes(1);
-      expect(mockHealthCheckModule.getSystemInfo).toHaveBeenCalledTimes(1);
-    });
-
-    it('should handle native module unavailable gracefully', async () => {
-      // Remove the native module
-      const originalModule = NativeModules.HealthCheckModule;
-      (NativeModules as any).HealthCheckModule = null;
-      
-      const newService = new HealthCheckService({
-        intervalMs: 30000,
-        onReport: onReportMock,
-        onError: onErrorMock,
-      });
-      
-      const report = await newService.runChecks();
-      
-      // Should return a report with all checks marked as unavailable/error
-      expect(report.checks.storage.status).toBe('critical');
-      expect(report.checks.storage.details.available).toBe(false);
-      expect(report.checks.storage.details.error).toContain('Native module unavailable');
-      
-      expect(onErrorMock).toHaveBeenCalled();
-      
-      // Restore
-      (NativeModules as any).HealthCheckModule = originalModule;
-    });
-
-    it('should handle individual native method failures', async () => {
-      mockHealthCheckModule.runStorageCheck.mockRejectedValueOnce(new Error('Storage check failed'));
-      
-      const report = await service.runChecks();
-      
-      expect(report.checks.storage.status).toBe('critical');
-      expect(report.checks.storage.details.error).toBe('Storage check failed');
-      expect(report.overallStatus).toBe('critical');
-      
-      // Other checks should still run
-      expect(mockHealthCheckModule.runShortcutsCheck).toHaveBeenCalled();
-      expect(mockHealthCheckModule.runBubbleCheck).toHaveBeenCalled();
-      expect(mockHealthCheckModule.runPerformanceCheck).toHaveBeenCalled();
-    });
-
-    it('should handle partial native module (some methods missing)', async () => {
-      const partialModule = {
-        runStorageCheck: mockHealthCheckModule.runStorageCheck,
-        runShortcutsCheck: mockHealthCheckModule.runShortcutsCheck,
-        // Missing runBubbleCheck and runPerformanceCheck
-        getSystemInfo: mockHealthCheckModule.getSystemInfo,
-      };
-      (NativeModules as any).HealthCheckModule = partialModule;
-      
-      const newService = new HealthCheckService({
-        intervalMs: 30000,
-        onReport: onReportMock,
-        onError: onErrorMock,
-      });
-      
-      const report = await newService.runChecks();
-      
-      expect(report.checks.storage.status).toBe('healthy');
-      expect(report.checks.shortcuts.status).toBe('healthy');
-      expect(report.checks.bubble.status).toBe('critical');
-      expect(report.checks.bubble.details.error).toContain('Method runBubbleCheck not available');
-      expect(report.checks.performance.status).toBe('critical');
-      expect(report.checks.performance.details.error).toContain('Method runPerformanceCheck not available');
-      
-      (NativeModules as any).HealthCheckModule = mockHealthCheckModule;
-    });
-  });
-
-  describe('Error Handling and Callbacks', () => {
-    it('should fire onError callback when native module throws', async () => {
-      mockHealthCheckModule.runStorageCheck.mockRejectedValueOnce(new Error('Native error'));
-      
-      await service.runChecks();
+      await service.startPeriodicChecks();
       
       expect(onErrorMock).toHaveBeenCalledWith(
         expect.objectContaining({
-          message: 'Native error',
           checkName: HealthCheckName.STORAGE,
+          error: expect.any(Error),
         })
       );
     });
 
-    it('should fire onError for each failed check', async () => {
+    it('should mark overall status UNHEALTHY when multiple checks fail', async () => {
       mockHealthCheckModule.runStorageCheck.mockRejectedValueOnce(new Error('Storage failed'));
       mockHealthCheckModule.runShortcutsCheck.mockRejectedValueOnce(new Error('Shortcuts failed'));
+      mockHealthCheckModule.runBubbleCheck.mockRejectedValueOnce(new Error('Bubble failed'));
       
-      await service.runChecks();
+      await service.startPeriodicChecks();
       
-      expect(onErrorMock).toHaveBeenCalledTimes(2);
-      expect(onErrorMock.mock.calls[0][0].checkName).toBe(HealthCheckName.STORAGE);
-      expect(onErrorMock.mock.calls[1][0].checkName).toBe(HealthCheckName.SHORTCUTS);
-    });
-
-    it('should not fire onError for successful checks', async () => {
-      await service.runChecks();
-      
-      expect(onErrorMock).not.toHaveBeenCalled();
-    });
-
-    it('should handle onReport callback throwing without breaking service', async () => {
-      onReportMock.mockImplementationOnce(() => { throw new Error('Callback error'); });
-      
-      // Should not throw
-      await expect(service.runChecks()).resolves.toBeDefined();
-      
-      // Service should still be functional
-      onReportMock.mockImplementationOnce(() => {});
-      const report = await service.runChecks();
-      expect(report).toBeDefined();
-    });
-
-    it('should handle onError callback throwing without breaking service', async () => {
-      mockHealthCheckModule.runStorageCheck.mockRejectedValueOnce(new Error('Native error'));
-      onErrorMock.mockImplementationOnce(() => { throw new Error('Callback error'); });
-      
-      // Should not throw
-      await expect(service.runChecks()).resolves.toBeDefined();
+      const report = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      expect(report.overallStatus).toBe(HealthStatus.UNHEALTHY);
     });
   });
 
-  describe('Cleanup and Resource Management', () => {
-    it('should clear interval on stopPeriodicChecks', async () => {
+  describe('Storage Corruption Handling', () => {
+    it('should report STORAGE_DEGRADED when MMKV returns invalid JSON', async () => {
+      mockStorage.set('health_check_cache', 'invalid json {{{');
+      
       await service.startPeriodicChecks();
-      const clearIntervalSpy = jest.spyOn(global, 'clearInterval');
       
-      service.stopPeriodicChecks();
-      
-      expect(clearIntervalSpy).toHaveBeenCalled();
-      clearIntervalSpy.mockRestore();
+      const report = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      expect(report.checks.storage.status).toBe(HealthStatus.DEGRADED);
+      expect(report.checks.storage.details?.corruptionDetected).toBe(true);
     });
 
-    it('should not leak intervals on multiple start/stop', async () => {
-      const setIntervalSpy = jest.spyOn(global, 'setInterval');
-      const clearIntervalSpy = jest.spyOn(global, 'clearInterval');
+    it('should report STORAGE_DEGRADED when MMKV returns malformed health data', async () => {
+      mockStorage.set('health_check_cache', JSON.stringify({ invalid: 'structure' }));
       
-      for (let i = 0; i < 3; i++) {
+      await service.startPeriodicChecks();
+      
+      const report = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      expect(report.checks.storage.status).toBe(HealthStatus.DEGRADED);
+      expect(report.checks.storage.details?.corruptionDetected).toBe(true);
+    });
+
+    it('should report STORAGE_DEGRADED when MMKV key contains null bytes', async () => {
+      mockStorage.set('health_check_cache', 'valid\x00data');
+      
+      await service.startPeriodicChecks();
+      
+      const report = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      expect(report.checks.storage.status).toBe(HealthStatus.DEGRADED);
+    });
+
+    it('should recover from corruption when valid data is written', async () => {
+      // First: corrupted data
+      mockStorage.set('health_check_cache', 'corrupted');
+      await service.startPeriodicChecks();
+      
+      let report = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      expect(report.checks.storage.status).toBe(HealthStatus.DEGRADED);
+      
+      // Second: valid data written by service
+      jest.advanceTimersByTime(30000);
+      await Promise.resolve();
+      
+      report = onReportMock.mock.calls[1][0] as SystemHealthReport;
+      expect(report.checks.storage.status).toBe(HealthStatus.HEALTHY);
+      expect(report.checks.storage.details?.corruptionDetected).toBe(false);
+    });
+
+    it('should handle MMKV getString throwing exception', async () => {
+      // We need to mock the MMKV instance to throw on getString
+      const { MMKV } = require('react-native-mmkv');
+      const mockInstance = MMKV.mock.results[0]?.value;
+      if (mockInstance) {
+        mockInstance.getString.mockImplementationOnce(() => {
+          throw new Error('MMKV read error');
+        });
+      }
+      
+      await service.startPeriodicChecks();
+      
+      const report = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      expect(report.checks.storage.status).toBe(HealthStatus.UNHEALTHY);
+      expect(report.checks.storage.error).toContain('MMKV read error');
+    });
+
+    it('should handle MMKV set throwing exception during write', async () => {
+      const { MMKV } = require('react-native-mmkv');
+      const mockInstance = MMKV.mock.results[0]?.value;
+      if (mockInstance) {
+        mockInstance.set.mockImplementationOnce(() => {
+          throw new Error('MMKV write error');
+        });
+      }
+      
+      await service.startPeriodicChecks();
+      
+      const report = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      expect(report.checks.storage.status).toBe(HealthStatus.DEGRADED);
+      expect(report.checks.storage.error).toContain('MMKV write error');
+    });
+  });
+
+  describe('Concurrent Periodic Checks', () => {
+    it('should not race when startPeriodicChecks called concurrently', async () => {
+      const startPromises = [
+        service.startPeriodicChecks(),
+        service.startPeriodicChecks(),
+        service.startPeriodicChecks(),
+      ];
+      
+      await Promise.all(startPromises);
+      
+      // Should only have run once initially
+      expect(onReportMock).toHaveBeenCalledTimes(1);
+      
+      jest.advanceTimersByTime(30000);
+      await Promise.resolve();
+      
+      // Should only run once per interval
+      expect(onReportMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('should maintain consistent lastReport under concurrent access', async () => {
+      await service.startPeriodicChecks();
+      
+      const initialReport = onReportMock.mock.calls[0][0] as SystemHealthReport;
+      const initialTimestamp = initialReport.timestamp;
+      
+      // Simulate concurrent check triggers by advancing timers rapidly
+      for (let i = 0; i < 5; i++) {
+        jest.advanceTimersByTime(100);
+        await Promise.resolve();
+      }
+      
+      // Advance to next interval
+      jest.advanceTimersByTime(30000);
+      await Promise.resolve();
+      
+      const secondReport = onReportMock.mock.calls[1][0] as SystemHealthReport;
+      expect(secondReport.timestamp).toBeGreaterThan(initialTimestamp);
+      
+      // Verify no duplicate reports in same interval
+      const timestamps = onReportMock.mock.calls.map(call => (call[0] as SystemHealthReport).timestamp);
+      const uniqueTimestamps = new Set(timestamps);
+      expect(uniqueTimestamps.size).toBe(timestamps.length);
+    });
+
+    it('should handle rapid start/stop cycles without leaking timers', async () => {
+      for (let i = 0; i < 10; i++) {
         await service.startPeriodicChecks();
         service.stopPeriodicChecks();
       }
       
-      expect(setIntervalSpy).toHaveBeenCalledTimes(3);
-      expect(clearIntervalSpy).toHaveBeenCalledTimes(3);
+      // Should not have any pending timers
+      jest.advanceTimersByTime(60000);
+      await Promise.resolve();
       
-      setIntervalSpy.mockRestore();
-      clearIntervalSpy.mockRestore();
+      // Only the last start should have produced a report (but it was stopped)
+      // Actually each start produces immediate report, but stop prevents interval
+      expect(onReportMock).toHaveBeenCalledTimes(10);
     });
 
-    it('should allow restart after stop', async () => {
-      await service
+    it('should serialize concurrent runCheck calls', async () => {
+      await service.startPeriodicChecks();
+      
+      // Trigger multiple manual checks concurrently
+      const checkPromises = [
+        service.runCheck(HealthCheckName.STORAGE),
+        service.runCheck(HealthCheckName.SHORTCUTS),
+        service.runCheck(HealthCheckName.BUBBLE),
+        service.runCheck(HealthCheckName.PERFORMANCE),
+      ];
+      
+      const results = await Promise.all(checkPromises);
+      
+      // All should complete successfully
+      results.forEach(result => {
+        expect(result).toBeDefined();
+        expect(result.status).toBeDefined();
+      });
+      
+      // Verify no duplicate native calls
+      expect(mockHealthCheckModule.runStorageCheck).toHaveBeenCalledTimes(2); // Once from periodic, once from manual
+      expect(mockHealthCheckModule.runShortcutsCheck).toHaveBeenCalledTimes(2);
+      expect(mockHealthCheckModule.runBubbleCheck).toHaveBeenCalledTimes(2);
+      expect(mockHealthCheckModule.runPerformanceCheck).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('Report Generation Under Load', () => {
+    it('should generate 100 reports rapidly with stable memory', async () => {
+      const reports: SystemHealthReport[] = [];
+      const originalOnReport = onReportMock;
+      
+      onReportMock.mockImplementation((report: SystemHealthReport) => {
+        reports.push(report);
+        originalOnReport(report);
+      });
+      
+      await service.startPeriodicChecks();

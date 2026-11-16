@@ -7,7 +7,9 @@
     "ios": "react-native run-ios",
     "lint": "eslint .",
     "start": "react-native start",
-    "test": "jest"
+    "test": "jest",
+    "test:verify": "jest --coverage --passWithNoTests --ci",
+    "test:ci": "jest --coverage --passWithNoTests --ci --maxWorkers=2"
   },
   "dependencies": {
     "react": "19.0.0",
@@ -34,6 +36,51 @@
     "prettier": "2.8.8",
     "react-test-renderer": "19.0.0",
     "typescript": "5.0.4"
+  },
+  "jest": {
+    "preset": "react-native",
+    "testEnvironment": "jsdom",
+    "setupFilesAfterSetup": [
+      "<rootDir>/jest.setup.ts"
+    ],
+    "testMatch": [
+      "<rootDir>/__tests__/**/*.test.{ts,tsx}"
+    ],
+    "moduleFileExtensions": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx",
+      "json",
+      "node"
+    ],
+    "transform": {
+      "^.+\\.(ts|tsx)$": [
+        "@babel/preset-typescript",
+        {
+          "allowDeclarations": true
+        }
+      ]
+    },
+    "collectCoverageFrom": [
+      "src/**/*.{ts,tsx}",
+      "!src/**/*.d.ts",
+      "!src/**/*.stories.tsx"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "statements": 80,
+        "branches": 80,
+        "functions": 80,
+        "lines": 80
+      }
+    },
+    "coverageReporters": [
+      "text",
+      "lcov",
+      "html"
+    ],
+    "verbose": true
   },
   "engines": {
     "node": ">=18"

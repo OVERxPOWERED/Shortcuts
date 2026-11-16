@@ -1,10 +1,16 @@
 import { DeviceEventEmitter, NativeModules } from 'react-native';
-import { useRef, useEffect, useContext } from 'react';
+import { useRef, useEffect, useLayoutEffect } from 'react';
+import PerformanceProfiler from '../services/performanceProfiler';
+import TelemetryService from '../services/telemetryService';
+import PerformanceMonitor from '../services/performanceMonitor';
 
 export default function useBubbleClickListner(singleClick, doubleClick, tripleClick) {
-
-
   const { InstalledApps } = NativeModules;
+
+  const clickCount = useRef([]);
+  const profilerRef = useRef(null);
+  const renderStartRef = useRef(0);
+  const memoryBaselineRef = useRef(0);
 
   const LaunchApp = (packageName) => {
     InstalledApps.launchApp(packageName)
@@ -16,37 +22,75 @@ export default function useBubbleClickListner(singleClick, doubleClick, tripleCl
       });
   };
 
-  const clickCount = useRef([]);
+  useEffect(() => {
+    profilerRef.current = PerformanceProfiler.getInstance();
+    profilerRef.current.initialize();
+    memoryBaselineRef.current = PerformanceMonitor.getMemoryUsage();
+
+    return () => {
+      if (profilerRef.current) {
+        profilerRef.current.cleanup();
+      }
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    renderStartRef.current = performance.now();
+  });
+
   useEffect(() => {
     let clickTimeout;
 
-    const subscription = DeviceEventEmitter.addListener('floating-bubble-press', () => {
-      const Now = new Date().getTime();
-      clickCount.current.push(Now);
+    const subscription = DeviceEventEmitter.addListener('floating-bubble-press', (event) => {
+      const eventTimestamp = event?.timestamp || new Date().getTime();
+      const handlerStart = performance.now();
 
-      // Filter old clicks (within 500ms)
-      clickCount.current = clickCount.current.filter((time) => Now - time <= 500);
+      const profileId = profilerRef.current?.profileBubbleTap('tap', async () => {
+        const Now = new Date().getTime();
+        clickCount.current.push(Now);
 
-      // Clear any previous timer
-      if (clickTimeout) clearTimeout(clickTimeout);
+        clickCount.current = clickCount.current.filter((time) => Now - time <= 500);
 
-      // Wait 300ms before deciding how many clicks we got 
-      clickTimeout = setTimeout(() => {
-        const clicks = clickCount.current.length;
+        if (clickTimeout) clearTimeout(clickTimeout);
 
-        if (clicks === 1) {
-          if (singleClick?.task === "Launch App") {
-            LaunchApp(singleClick?.packageName)
+        clickTimeout = setTimeout(() => {
+          const clicks = clickCount.current.length;
+          const handlerEnd = performance.now();
+          const tapLatency = handlerEnd - eventTimestamp;
+          const handlerDuration = handlerEnd - handlerStart;
+          const renderTime = performance.now() - renderStartRef.current;
+          const currentMemory = PerformanceMonitor.getMemoryUsage();
+          const memoryDelta = currentMemory - memoryBaselineRef.current;
+
+          const metrics = {
+            tapLatency,
+            handlerDuration,
+            renderTime,
+            memoryDelta,
+            clickCount: clicks,
+            timestamp: Now,
+          };
+
+          TelemetryService.sendPerformance('bubble_interaction', metrics);
+
+          if (clicks === 1) {
+            if (singleClick?.task === "Launch App") {
+              LaunchApp(singleClick?.packageName);
+            }
+          } else if (clicks === 2) {
+            if (doubleClick?.task === "Launch App") LaunchApp(doubleClick?.packageName);
+          } else if (clicks === 3) {
+            if (tripleClick?.task === "Launch App") LaunchApp(tripleClick?.packageName);
           }
-        } else if (clicks === 2) {
-          if (doubleClick?.task === "Launch App") LaunchApp(doubleClick?.packageName)// double
 
-        } else if (clicks === 3) {
-          if (tripleClick?.task === "Launch App") LaunchApp(tripleClick?.packageName) // triple
-        }
+          clickCount.current = [];
+          memoryBaselineRef.current = currentMemory;
+        }, 300);
+      });
 
-        clickCount.current = []; // reset after action
-      }, 300); // wait to check if more clicks come
+      if (profileId) {
+        profilerRef.current?.endProfile(profileId);
+      }
     });
 
     return () => {
@@ -54,5 +98,4 @@ export default function useBubbleClickListner(singleClick, doubleClick, tripleCl
       if (clickTimeout) clearTimeout(clickTimeout);
     };
   }, [singleClick, doubleClick, tripleClick]);
-
 }

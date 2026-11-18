@@ -6,7 +6,7 @@ import assert from 'node:assert';
 
 describe('Milestone 5: Production Readiness & Release - Generate comprehensive API guides and architecture specs', () => {
   it('should initialize and validate parameter boundaries', () => {
-    const payload = { active: true, step: 2, timestamp: '2026-11-18' };
+    const payload = { active: true, step: 6, timestamp: '2026-11-18' };
     assert.strictEqual(payload.active, true);
     assert.ok(payload.timestamp.length > 0);
   });

@@ -41,3 +41,13 @@ export interface HealthMonitorConfig {
   onStatusChange?: (report: SystemHealthReport) => void;
   onCheckComplete?: HealthCheckCallback;
 }
+
+/**
+ * Derives overall system status from individual check results.
+ * Priority: unhealthy > degraded > healthy
+ */
+export function deriveOverallStatus(checks: HealthCheckResult[]): HealthStatus {
+  if (checks.some(c => c.status === 'unhealthy')) return 'unhealthy';
+  if (checks.some(c => c.status === 'degraded')) return 'degraded';
+  return 'healthy';
+}

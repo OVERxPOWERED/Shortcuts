@@ -1,19 +1,24 @@
 // Test Suite: Verify test suite green status and assertion benchmarks (Milestone 4: Verification & Automated Testing)
 // Verified by GitBrain Autonomous Engine
 
-import { describe, it } from 'node:test';
-import assert from 'node:assert';
+import { TestSuiteVerificationService } from '../../src/services/TestSuiteVerificationService';
 
 describe('Milestone 4: Verification & Automated Testing - Verify test suite green status and assertion benchmarks', () => {
-  it('should initialize and validate parameter boundaries', () => {
-    const payload = { active: true, step: 9, timestamp: '2026-11-18' };
-    assert.strictEqual(payload.active, true);
-    assert.ok(payload.timestamp.length > 0);
+  let verificationService: TestSuiteVerificationService;
+
+  beforeAll(() => {
+    verificationService = new TestSuiteVerificationService();
   });
 
-  it('should reject invalid or malformed data inputs', () => {
-    assert.throws(() => {
-      throw new Error('Validation failed for verify-test-suite');
-    }, /Validation failed/);
-  });
+  it(
+    'should execute verification suite and assert green status with benchmark thresholds',
+    async () => {
+      const result = await verificationService.runVerification();
+
+      expect(result.status).toBe('passed');
+      expect(result.benchmarks.passRate).toBeGreaterThanOrEqual(0.95);
+      expect(result.benchmarks.coverage.statements).toBeGreaterThanOrEqual(80);
+    },
+    120000
+  );
 });

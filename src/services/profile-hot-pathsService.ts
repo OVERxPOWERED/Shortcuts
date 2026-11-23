@@ -6,6 +6,7 @@
 
 import { PerformanceProfiler } from './performanceProfiler';
 import { PerformanceMonitor } from './performanceMonitor';
+import { MMKV } from 'react-native-mmkv';
 
 export interface HotPathEntry {
   functionName: string;
@@ -46,6 +47,9 @@ export interface PerformanceSample {
   metadata?: Record<string, unknown>;
 }
 
+const storage = new MMKV({ id: 'hot-path-index' });
+const HOT_PATH_INDEX_KEY = 'hot-path-index.json';
+
 export class ProfileHotPathsService {
   private initialized: boolean;
   private profiler: PerformanceProfiler;
@@ -59,7 +63,7 @@ export class ProfileHotPathsService {
     this.monitor = PerformanceMonitor.getInstance();
   }
 
-  public async profileHotPaths(params: Record<string, unknown> = {}): Promise<ProfileHotPathsResult> {
+  public async runProfiling(workloads: string[]): Promise<ProfileHotPathsResult> {
     if (!this.initialized) {
       throw new Error('ProfileHotPathsService is not ready');
     }
@@ -69,59 +73,39 @@ export class ProfileHotPathsService {
     const allSamples: PerformanceSample[] = [];
 
     try {
-      // Start performance monitoring session
       await this.monitor.startSession('hot-path-profiling', {
-        metadata: { profilingType: 'hot-path-analysis', ...params },
+        metadata: { profilingType: 'hot-path-analysis', workloads },
       });
 
-      // Run representative workload simulations
-      const shortcutSimulation = await this.runWorkloadSimulation('shortcut-execution', () =>
-        this.simulateShortcutExecution()
-      );
-      workloadsRun.push(shortcutSimulation.name);
-      allSamples.push(...shortcutSimulation.samples);
+      for (const workload of workloads) {
+        const simulation = await this.runWorkloadSimulation(workload, () =>
+          this.executeWorkload(workload)
+        );
+        workloadsRun.push(simulation.name);
+        allSamples.push(...simulation.samples);
+      }
 
-      const bubbleSimulation = await this.runWorkloadSimulation('bubble-interactions', () =>
-        this.simulateBubbleInteractions()
-      );
-      workloadsRun.push(bubbleSimulation.name);
-      allSamples.push(...bubbleSimulation.samples);
-
-      const storageSimulation = await this.runWorkloadSimulation('storage-operations', () =>
-        this.simulateStorageOperations()
-      );
-      workloadsRun.push(storageSimulation.name);
-      allSamples.push(...storageSimulation.samples);
-
-      const navigationSimulation = await this.runWorkloadSimulation('navigation-transitions', () =>
-        this.simulateNavigationTransitions()
-      );
-      workloadsRun.push(navigationSimulation.name);
-      allSamples.push(...navigationSimulation.samples);
-
-      // Collect flame graph data and timing metrics from profiler
       const profilerSamples = this.profiler.getSamples();
-      allSamples.push(...profilerSamples.map(s => ({
-        functionName: s.name,
-        file: s.file || 'unknown',
-        duration: s.duration,
-        timestamp: s.timestamp,
-        metadata: s.metadata,
-      })));
+      allSamples.push(
+        ...profilerSamples.map((s) => ({
+          functionName: s.name,
+          file: s.file || 'unknown',
+          duration: s.duration,
+          timestamp: s.timestamp,
+          metadata: s.metadata,
+        }))
+      );
 
-      // Analyze hot paths
       const hotPathIndex = this.analyzeHotPaths(allSamples);
-
-      // Apply performance indexing by tagging hot paths in PerformanceMonitor
       await this.applyPerformanceIndexing(hotPathIndex);
+      await this.persistHotPathIndex(hotPathIndex);
 
       const profilingDuration = performance.now() - startTime;
       const totalSamples = allSamples.length;
 
-      // End monitoring session
       await this.monitor.endSession('hot-path-profiling');
 
-      return {
+      const result: ProfileHotPathsResult = {
         status: 'completed',
         milestone: 'Milestone 5: Production Readiness & Release',
         processedAt: new Date().toISOString(),
@@ -129,14 +113,31 @@ export class ProfileHotPathsService {
           hotPathIndex,
           totalSamples,
           profilingDuration,
-          topHotPathsCount: hotPathIndex.length,
+          topHotPathsCount: Math.min(this.TOP_HOT_PATHS_COUNT, hotPathIndex.length),
           workloadsRun,
         },
       };
+
+      return result;
     } catch (error) {
-      await this.monitor.endSession('hot-path-profiling', { error: String(error) });
+      await this.monitor.endSession('hot-path-profiling');
       throw error;
     }
+  }
+
+  public async profileHotPaths(params: Record<string, unknown> = {}): Promise<ProfileHotPathsResult> {
+    if (!this.initialized) {
+      throw new Error('ProfileHotPathsService is not ready');
+    }
+
+    const defaultWorkloads = [
+      'shortcut-execution',
+      'bubble-render',
+      'storage-read-write',
+      'input-sanitization',
+    ];
+
+    return this.runProfiling(defaultWorkloads);
   }
 
   private async runWorkloadSimulation(
@@ -147,243 +148,198 @@ export class ProfileHotPathsService {
     const startTime = performance.now();
     let operations = 0;
 
-    // Enable profiler sampling for this workload
-    this.profiler.startSampling(1000); // 1ms sampling interval
+    this.profiler.start();
 
     for (let i = 0; i < this.SIMULATION_ITERATIONS; i++) {
       const iterStart = performance.now();
       await workloadFn();
       const iterDuration = performance.now() - iterStart;
-      operations++;
 
-      // Record sample for this iteration
       samples.push({
         functionName: name,
-        file: 'workload-simulation',
+        file: this.getWorkloadFile(name),
         duration: iterDuration,
-        timestamp: performance.now(),
-        metadata: { iteration: i, workload: name },
+        timestamp: Date.now(),
+        metadata: { iteration: i },
       });
+      operations++;
     }
 
-    this.profiler.stopSampling();
+    this.profiler.stop();
 
-    return {
-      name,
-      duration: performance.now() - startTime,
-      operations,
-      samples,
-    };
+    const duration = performance.now() - startTime;
+
+    return { name, duration, operations, samples };
+  }
+
+  private async executeWorkload(workload: string): Promise<void> {
+    switch (workload) {
+      case 'shortcut-execution':
+        await this.simulateShortcutExecution();
+        break;
+      case 'bubble-render':
+        await this.simulateBubbleRender();
+        break;
+      case 'storage-read-write':
+        await this.simulateStorageReadWrite();
+        break;
+      case 'input-sanitization':
+        await this.simulateInputSanitization();
+        break;
+      default:
+        await this.simulateGenericWorkload();
+    }
   }
 
   private async simulateShortcutExecution(): Promise<void> {
-    // Simulate shortcut execution workload
-    const shortcuts = [
-      { id: '1', action: 'open-app', payload: { appId: 'com.example.app' } },
-      { id: '2', action: 'toggle-setting', payload: { setting: 'darkMode' } },
-      { id: '3', action: 'send-message', payload: { contact: '123', text: 'Hello' } },
-      { id: '4', action: 'navigate', payload: { route: '/settings' } },
-      { id: '5', action: 'run-script', payload: { script: 'backup' } },
+    const start = performance.now();
+    for (let i = 0; i < 10; i++) {
+      const data = { action: 'test', payload: { id: i, timestamp: Date.now() } };
+      JSON.stringify(data);
+      JSON.parse(JSON.stringify(data));
+    }
+    const duration = performance.now() - start;
+    this.recordSample('simulateShortcutExecution', 'profile-hot-pathsService.ts', duration);
+  }
+
+  private async simulateBubbleRender(): Promise<void> {
+    const start = performance.now();
+    const elements = Array.from({ length: 50 }, (_, i) => ({ id: i, label: `Item ${i}` }));
+    elements.map((el) => `<div>${el.label}</div>`).join('');
+    const duration = performance.now() - start;
+    this.recordSample('simulateBubbleRender', 'profile-hot-pathsService.ts', duration);
+  }
+
+  private async simulateStorageReadWrite(): Promise<void> {
+    const start = performance.now();
+    const testKey = 'perf-test-key';
+    const testValue = { data: 'x'.repeat(1024), timestamp: Date.now() };
+    storage.set(testKey, JSON.stringify(testValue));
+    const retrieved = storage.getString(testKey);
+    JSON.parse(retrieved || '{}');
+    storage.delete(testKey);
+    const duration = performance.now() - start;
+    this.recordSample('simulateStorageReadWrite', 'profile-hot-pathsService.ts', duration);
+  }
+
+  private async simulateInputSanitization(): Promise<void> {
+    const start = performance.now();
+    const inputs = [
+      '<script>alert(1)</script>',
+      'normal input',
+      'SELECT * FROM users;--',
+      '<img src=x onerror=alert(1)>',
+      'valid@example.com',
     ];
-
-    for (const shortcut of shortcuts) {
-      // Simulate shortcut parsing
-      await this.simulateAsyncWork(0.5, 'parse-shortcut');
-      
-      // Simulate action dispatch
-      await this.simulateAsyncWork(1.2, 'dispatch-action');
-      
-      // Simulate result handling
-      await this.simulateAsyncWork(0.3, 'handle-result');
-    }
+    inputs.forEach((input) => {
+      input.replace(/[<>]/g, '').replace(/script/gi, '').trim();
+    });
+    const duration = performance.now() - start;
+    this.recordSample('simulateInputSanitization', 'profile-hot-pathsService.ts', duration);
   }
 
-  private async simulateBubbleInteractions(): Promise<void> {
-    // Simulate floating bubble interactions
-    const interactions = [
-      'bubble-tap',
-      'bubble-drag-start',
-      'bubble-drag-move',
-      'bubble-drag-end',
-      'bubble-long-press',
-      'bubble-expand',
-      'bubble-collapse',
-      'bubble-menu-open',
-      'bubble-menu-select',
-    ];
-
-    for (const interaction of interactions) {
-      // Simulate touch event processing
-      await this.simulateAsyncWork(0.8, `process-${interaction}`);
-      
-      // Simulate animation frame
-      await this.simulateAsyncWork(1.5, `animate-${interaction}`);
-      
-      // Simulate state update
-      await this.simulateAsyncWork(0.4, `update-state-${interaction}`);
-    }
+  private async simulateGenericWorkload(): Promise<void> {
+    const start = performance.now();
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    const duration = performance.now() - start;
+    this.recordSample('simulateGenericWorkload', 'profile-hot-pathsService.ts', duration);
   }
 
-  private async simulateStorageOperations(): Promise<void> {
-    // Simulate MMKV storage operations
-    const operations = [
-      { type: 'set', key: 'user-preferences', size: 1024 },
-      { type: 'get', key: 'user-preferences', size: 1024 },
-      { type: 'set', key: 'shortcut-history', size: 4096 },
-      { type: 'get', key: 'shortcut-history', size: 4096 },
-      { type: 'set', key: 'bubble-position', size: 256 },
-      { type: 'get', key: 'bubble-position', size: 256 },
-      { type: 'delete', key: 'temp-cache', size: 512 },
-      { type: 'clear', key: '', size: 0 },
-    ];
-
-    for (const op of operations) {
-      // Simulate storage I/O
-      await this.simulateAsyncWork(op.type === 'set' ? 2.0 : 1.0, `storage-${op.type}`);
-      
-      // Simulate serialization/deserialization
-      if (op.type === 'set' || op.type === 'get') {
-        await this.simulateAsyncWork(0.5, `serialize-${op.type}`);
-      }
-    }
-  }
-
-  private async simulateNavigationTransitions(): Promise<void> {
-    // Simulate navigation transitions
-    const transitions = [
-      { from: 'home', to: 'shortcuts', type: 'push' },
-      { from: 'shortcuts', to: 'settings', type: 'push' },
-      { from: 'settings', to: 'shortcuts', type: 'pop' },
-      { from: 'shortcuts', to: 'home', type: 'pop' },
-      { from: 'home', to: 'bubble-settings', type: 'modal' },
-      { from: 'bubble-settings', to: 'home', type: 'dismiss' },
-    ];
-
-    for (const transition of transitions) {
-      // Simulate route resolution
-      await this.simulateAsyncWork(0.6, `resolve-route-${transition.type}`);
-      
-      // Simulate transition animation
-      await this.simulateAsyncWork(3.0, `animate-transition-${transition.type}`);
-      
-      // Simulate component mount/unmount
-      await this.simulateAsyncWork(1.2, `mount-${transition.to}`);
-      await this.simulateAsyncWork(0.8, `unmount-${transition.from}`);
-    }
-  }
-
-  private async simulateAsyncWork(durationMs: number, label: string): Promise<void> {
-    // Use profiler to mark this async work
-    const markId = this.profiler.markStart(label);
-    
-    // Simulate actual async work with setTimeout
-    await new Promise(resolve => setTimeout(resolve, durationMs));
-    
-    this.profiler.markEnd(markId);
-  }
-
-  private analyzeHotPaths(samples: PerformanceSample[]): HotPathEntry[] {
-    if (samples.length === 0) {
-      return [];
-    }
-
-    // Group samples by function name and file
-    const functionGroups = new Map<string, PerformanceSample[]>();
-    
-    for (const sample of samples) {
-      const key = `${sample.functionName}@${sample.file}`;
-      if (!functionGroups.has(key)) {
-        functionGroups.set(key, []);
-      }
-      functionGroups.get(key)!.push(sample);
-    }
-
-    // Calculate statistics for each function
-    const functionStats: HotPathEntry[] = [];
-    let totalTime = 0;
-
-    for (const [key, groupSamples] of functionGroups.entries()) {
-      const [functionName, file] = key.split('@');
-      const durations = groupSamples.map(s => s.duration);
-      const callCount = durations.length;
-      const cumulativeTime = durations.reduce((sum, d) => sum + d, 0);
-      const avgDuration = cumulativeTime / callCount;
-      const minDuration = Math.min(...durations);
-      const maxDuration = Math.max(...durations);
-
-      totalTime += cumulativeTime;
-
-      functionStats.push({
-        functionName,
-        file,
-        avgDuration,
-        callCount,
-        percentageOfTotalTime: 0, // Will calculate after totalTime is known
-        cumulativeTime,
-        minDuration,
-        maxDuration,
-      });
-    }
-
-    // Calculate percentages and sort by cumulative time descending
-    for (const stat of functionStats) {
-      stat.percentageOfTotalTime = totalTime > 0 ? (stat.cumulativeTime / totalTime) * 100 : 0;
-    }
-
-    functionStats.sort((a, b) => b.cumulativeTime - a.cumulativeTime);
-
-    // Return top N hot paths
-    return functionStats.slice(0, this.TOP_HOT_PATHS_COUNT);
-  }
-
-  private async applyPerformanceIndexing(hotPaths: HotPathEntry[]): Promise<void> {
-    // Tag hot paths in PerformanceMonitor with metadata
-    for (const hotPath of hotPaths) {
-      await this.monitor.tagPerformanceMetric('hot-path', hotPath.functionName, {
-        file: hotPath.file,
-        avgDuration: hotPath.avgDuration,
-        callCount: hotPath.callCount,
-        percentageOfTotalTime: hotPath.percentageOfTotalTime,
-        cumulativeTime: hotPath.cumulativeTime,
-        minDuration: hotPath.minDuration,
-        maxDuration: hotPath.maxDuration,
-        indexedAt: new Date().toISOString(),
-        severity: this.calculateSeverity(hotPath.percentageOfTotalTime),
-      });
-    }
-
-    // Also create a summary index
-    await this.monitor.tagPerformanceMetric('hot-path-index', 'summary', {
-      totalHotPaths: hotPaths.length,
-      topFunction: hotPaths[0]?.functionName || 'none',
-      topPercentage: hotPaths[0]?.percentageOfTotalTime || 0,
-      indexedAt: new Date().toISOString(),
+  private recordSample(functionName: string, file: string, duration: number): void {
+    this.profiler.recordSample({
+      name: functionName,
+      file,
+      duration,
+      timestamp: Date.now(),
+      metadata: { source: 'workload-simulation' },
     });
   }
 
-  private calculateSeverity(percentage: number): 'critical' | 'high' | 'medium' | 'low' {
-    if (percentage >= 20) return 'critical';
-    if (percentage >= 10) return 'high';
-    if (percentage >= 5) return 'medium';
-    return 'low';
+  private getWorkloadFile(workload: string): string {
+    const fileMap: Record<string, string> = {
+      'shortcut-execution': 'shortcutExecutor.ts',
+      'bubble-render': 'FloatingBubble.tsx',
+      'storage-read-write': 'storageService.ts',
+      'input-sanitization': 'inputSanitizer.ts',
+    };
+    return fileMap[workload] || 'unknown.ts';
   }
 
-  // Public method to get current hot path index without re-profiling
-  public getHotPathIndex(): HotPathEntry[] {
-    const samples = this.profiler.getSamples().map(s => ({
-      functionName: s.name,
-      file: s.file || 'unknown',
-      duration: s.duration,
-      timestamp: s.timestamp,
-      metadata: s.metadata,
-    }));
-    return this.analyzeHotPaths(samples);
+  private analyzeHotPaths(samples: PerformanceSample[]): HotPathEntry[] {
+    const functionStats = new Map<
+      string,
+      { durations: number[]; file: string; count: number }
+    >();
+
+    for (const sample of samples) {
+      const key = `${sample.functionName}@${sample.file}`;
+      const existing = functionStats.get(key) || {
+        durations: [],
+        file: sample.file,
+        count: 0,
+      };
+      existing.durations.push(sample.duration);
+      existing.count++;
+      functionStats.set(key, existing);
+    }
+
+    const totalTime = samples.reduce((sum, s) => sum + s.duration, 0);
+
+    const entries: HotPathEntry[] = Array.from(functionStats.entries()).map(
+      ([key, stats]) => {
+        const [functionName, file] = key.split('@');
+        const sortedDurations = [...stats.durations].sort((a, b) => a - b);
+        const cumulativeTime = sortedDurations.reduce((sum, d) => sum + d, 0);
+        const avgDuration = cumulativeTime / stats.count;
+        const minDuration = sortedDurations[0] || 0;
+        const maxDuration = sortedDurations[sortedDurations.length - 1] || 0;
+        const percentageOfTotalTime = totalTime > 0 ? (cumulativeTime / totalTime) * 100 : 0;
+
+        return {
+          functionName,
+          file,
+          avgDuration,
+          callCount: stats.count,
+          percentageOfTotalTime,
+          cumulativeTime,
+          minDuration,
+          maxDuration,
+        };
+      }
+    );
+
+    return entries
+      .sort((a, b) => b.percentageOfTotalTime - a.percentageOfTotalTime)
+      .slice(0, this.TOP_HOT_PATHS_COUNT);
   }
 
-  // Public method to clear profiler data
-  public clearProfilerData(): void {
-    this.profiler.clearSamples();
+  private async applyPerformanceIndexing(hotPathIndex: HotPathEntry[]): Promise<void> {
+    for (const entry of hotPathIndex) {
+      await this.monitor.tagHotPath(entry.functionName, entry.file, {
+        avgDuration: entry.avgDuration,
+        callCount: entry.callCount,
+        percentageOfTotalTime: entry.percentageOfTotalTime,
+      });
+    }
+  }
+
+  private async persistHotPathIndex(hotPathIndex: HotPathEntry[]): Promise<void> {
+    const data = {
+      generatedAt: new Date().toISOString(),
+      hotPathIndex,
+      version: 1,
+    };
+    storage.set(HOT_PATH_INDEX_KEY, JSON.stringify(data));
+  }
+
+  public getPersistedHotPathIndex(): HotPathEntry[] | null {
+    const stored = storage.getString(HOT_PATH_INDEX_KEY);
+    if (!stored) return null;
+    try {
+      const parsed = JSON.parse(stored);
+      return parsed.hotPathIndex || null;
+    } catch {
+      return null;
+    }
   }
 }
-
-export const defaultProfileHotPaths = new ProfileHotPathsService();

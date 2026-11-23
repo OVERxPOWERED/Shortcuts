@@ -147,14 +147,32 @@ export class TestSuiteVerificationService extends EventEmitter {
     });
   }
 
+  static async runVerification(projectRoot?: string, outputPath?: string): Promise<VerificationResult> {
+    const service = new TestSuiteVerificationService(projectRoot);
+    const result = await service.verify();
+    
+    if (outputPath) {
+      const outputDir = path.dirname(outputPath);
+      if (!fs.existsSync(outputDir)) {
+        fs.mkdirSync(outputDir, { recursive: true });
+      }
+      fs.writeFileSync(outputPath, JSON.stringify(result, null, 2), 'utf8');
+    }
+    
+    return result;
+  }
+
   private buildJestArgs(): string[] {
     const args = [
       '--json',
-      '--coverage',
+      '--outputFile=/dev/stdout',
       '--testPathPattern=tests',
-      '--passWithNoTests',
+      '--coverage',
+      '--coverageReporters=json',
+      '--coverageDirectory=/tmp/coverage',
       '--no-cache',
-      '--runInBand',
+      '--forceExit',
+      '--detectOpenHandles',
     ];
 
     if (fs.existsSync(this.jestConfigPath)) {
@@ -166,39 +184,47 @@ export class TestSuiteVerificationService extends EventEmitter {
 
   private resolveJestCommand(): string {
     const localJest = path.join(this.projectRoot, 'node_modules', '.bin', 'jest');
-    const localJestCmd = process.platform === 'win32' ? `${localJest}.cmd` : localJest;
-    
-    if (fs.existsSync(localJestCmd)) {
-      return localJestCmd;
+    if (fs.existsSync(localJest)) {
+      return localJest;
     }
-    
     return 'npx';
   }
 
-  private parseJestOutput(exitCode: number | null, signal: NodeJS.Signals | null, duration: number): VerificationResult {
-    let jestOutput: JestAggregatedResult;
-
+  private parseJestOutput(code: number | null, signal: NodeJS.Signals | null, duration: number): VerificationResult {
+    let aggregatedResult: JestAggregatedResult;
+    
     try {
       const jsonStart = this.stdoutBuffer.indexOf('{');
       const jsonEnd = this.stdoutBuffer.lastIndexOf('}') + 1;
-      
       if (jsonStart === -1 || jsonEnd === 0) {
         throw new Error('No JSON output found in Jest stdout');
       }
-
       const jsonOutput = this.stdoutBuffer.slice(jsonStart, jsonEnd);
-      jestOutput = JSON.parse(jsonOutput);
-    } catch (error) {
-      throw new Error(`Failed to parse Jest JSON output: ${(error as Error).message}\nStdout: ${this.stdoutBuffer.slice(0, 500)}`);
+      aggregatedResult = JSON.parse(jsonOutput);
+    } catch (parseError) {
+      throw new Error(`Failed to parse Jest JSON output: ${(parseError as Error).message}\nStdout: ${this.stdoutBuffer.slice(0, 500)}`);
     }
 
-    const benchmarks = this.extractBenchmarks(jestOutput, duration);
-    const failures = this.extractFailures(jestOutput);
-    const status = this.determineStatus(exitCode, signal, jestOutput, failures.length);
+    const coverage = this.calculateCoverage(aggregatedResult.coverageMap);
+    const failures = this.extractFailures(aggregatedResult.testResults);
+    const memoryUsage = this.getMemoryUsage();
+
+    const status: TestSuiteStatus = signal ? 'error' : (aggregatedResult.success ? 'passed' : 'failed');
 
     return {
       status,
-      benchmarks,
+      benchmarks: {
+        totalTests: aggregatedResult.numTotalTests,
+        passedTests: aggregatedResult.numPassedTests,
+        failedTests: aggregatedResult.numFailedTests,
+        skippedTests: aggregatedResult.numPendingTests,
+        passRate: aggregatedResult.numTotalTests > 0 
+          ? (aggregatedResult.numPassedTests / aggregatedResult.numTotalTests) * 100 
+          : 100,
+        duration,
+        coverage,
+        memoryUsage,
+      },
       failures,
       timestamp: new Date(),
       jestVersion: this.getJestVersion(),
@@ -206,43 +232,7 @@ export class TestSuiteVerificationService extends EventEmitter {
     };
   }
 
-  private extractBenchmarks(jestOutput: JestAggregatedResult, duration: number): BenchmarkMetrics {
-    const totalTests = jestOutput.numTotalTests;
-    const passedTests = jestOutput.numPassedTests;
-    const failedTests = jestOutput.numFailedTests;
-    const skippedTests = jestOutput.numPendingTests;
-    const passRate = totalTests > 0 ? (passedTests / totalTests) * 100 : 100;
-
-    let coverage = {
-      statements: 0,
-      branches: 0,
-      functions: 0,
-      lines: 0,
-    };
-
-    if (jestOutput.coverageMap) {
-      coverage = this.calculateCoverage(jestOutput.coverageMap);
-    }
-
-    const memoryUsage = process.memoryUsage();
-
-    return {
-      totalTests,
-      passedTests,
-      failedTests,
-      skippedTests,
-      passRate: Math.round(passRate * 100) / 100,
-      duration,
-      coverage,
-      memoryUsage: {
-        heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024 * 100) / 100,
-        heapTotal: Math.round(memoryUsage.heapTotal / 1024 / 1024 * 100) / 100,
-        external: Math.round(memoryUsage.external / 1024 / 1024 * 100) / 100,
-      },
-    };
-  }
-
-  private calculateCoverage(coverageMap: JestAggregatedResult['coverageMap']): BenchmarkMetrics['coverage'] {
+  private calculateCoverage(coverageMap?: JestAggregatedResult['coverageMap']): BenchmarkMetrics['coverage'] {
     if (!coverageMap) {
       return { statements: 0, branches: 0, functions: 0, lines: 0 };
     }
@@ -274,7 +264,7 @@ export class TestSuiteVerificationService extends EventEmitter {
         if (count > 0) coveredFunctions++;
       }
 
-      const lineMap = this.extractLineCoverage(fileCoverage);
+      const lineMap = this.buildLineMap(fileCoverage);
       for (const [, count] of Object.entries(lineMap)) {
         totalLines++;
         if (count > 0) coveredLines++;
@@ -289,28 +279,37 @@ export class TestSuiteVerificationService extends EventEmitter {
     };
   }
 
-  private extractLineCoverage(fileCoverage: NonNullable<JestAggregatedResult['coverageMap']>[string]): Record<string, number> {
+  private buildLineMap(fileCoverage: NonNullable<JestAggregatedResult['coverageMap']>[string]): Record<string, number> {
     const lineMap: Record<string, number> = {};
     
-    for (const [statementId, count] of Object.entries(fileCoverage.s)) {
-      const statement = fileCoverage.statementMap[statementId];
-      if (statement) {
-        const line = statement.start.line;
-        lineMap[line] = (lineMap[line] || 0) + count;
+    for (const [stmtId, count] of Object.entries(fileCoverage.s)) {
+      const stmt = fileCoverage.statementMap[stmtId];
+      if (stmt) {
+        for (let line = stmt.start.line; line <= stmt.end.line; line++) {
+          const key = `${line}`;
+          lineMap[key] = (lineMap[key] || 0) + count;
+        }
       }
     }
-
+    
     return lineMap;
   }
 
-  private extractFailures(jestOutput: JestAggregatedResult): TestFailure[] {
+  private extractFailures(testResults: JestAggregatedResult['testResults']): TestFailure[] {
     const failures: TestFailure[] = [];
 
-    for (const testResult of jestOutput.testResults) {
+    for (const testResult of testResults) {
       if (testResult.status === 'failed') {
         for (const failureMessage of testResult.failureMessages) {
-          const parsed = this.parseFailureMessage(failureMessage, testResult);
-          failures.push(parsed);
+          const fileMatch = failureMessage.match(/at\s+(.+?):(\d+):(\d+)/);
+          const file = fileMatch ? fileMatch[1] : 'unknown';
+          
+          failures.push({
+            testName: [...testResult.ancestorTitles, testResult.name].join(' > '),
+            file,
+            message: failureMessage.split('\n')[0],
+            stack: failureMessage,
+          });
         }
       }
     }
@@ -318,45 +317,26 @@ export class TestSuiteVerificationService extends EventEmitter {
     return failures;
   }
 
-  private parseFailureMessage(message: string, testResult: JestAggregatedResult['testResults'][0]): TestFailure {
-    const lines = message.split('\n');
-    let testName = testResult.ancestorTitles.join(' > ') + ' > ' + (lines[0] || 'Unknown test');
-    let file = 'unknown';
-    let stack: string | undefined;
-
-    const fileMatch = message.match(/at\s+(.+?):(\d+):(\d+)/);
-    if (fileMatch) {
-      file = fileMatch[1];
-    }
-
-    const stackStart = message.indexOf('\n    at ');
-    if (stackStart !== -1) {
-      stack = message.slice(stackStart + 1).trim();
-    }
-
+  private getMemoryUsage(): BenchmarkMetrics['memoryUsage'] {
+    const usage = process.memoryUsage();
     return {
-      testName: testName.trim(),
-      file,
-      message: lines[0] || 'Test failed',
-      stack,
+      heapUsed: Math.round(usage.heapUsed / 1024 / 1024 * 100) / 100,
+      heapTotal: Math.round(usage.heapTotal / 1024 / 1024 * 100) / 100,
+      external: Math.round(usage.external / 1024 / 1024 * 100) / 100,
     };
   }
 
-  private determineStatus(
-    exitCode: number | null,
-    signal: NodeJS.Signals | null,
-    jestOutput: JestAggregatedResult,
-    failureCount: number
-  ): TestSuiteStatus {
-    if (signal) {
-      return 'error';
+  private getJestVersion(): string {
+    try {
+      const packageJsonPath = path.join(this.projectRoot, 'node_modules', 'jest', 'package.json');
+      if (fs.existsSync(packageJsonPath)) {
+        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+        return pkg.version;
+      }
+    } catch {
+      // Ignore errors
     }
-
-    if (exitCode !== 0 && exitCode !== null) {
-      return jestOutput.success ? 'passed' : 'failed';
-    }
-
-    return failureCount > 0 ? 'failed' : 'passed';
+    return 'unknown';
   }
 
   private buildErrorResult(error: Error): VerificationResult {
@@ -370,6 +350,7 @@ export class TestSuiteVerificationService extends EventEmitter {
         passRate: 0,
         duration: Date.now() - this.startTime,
         coverage: { statements: 0, branches: 0, functions: 0, lines: 0 },
+        memoryUsage: this.getMemoryUsage(),
       },
       failures: [{
         testName: 'Process Error',
@@ -394,11 +375,12 @@ export class TestSuiteVerificationService extends EventEmitter {
         passRate: 0,
         duration,
         coverage: { statements: 0, branches: 0, functions: 0, lines: 0 },
+        memoryUsage: this.getMemoryUsage(),
       },
       failures: [{
         testName: 'Parse Error',
         file: 'testSuiteVerificationService.ts',
-        message: `Failed to parse Jest output: ${error.message}`,
+        message: error.message,
         stack: error.stack,
       }],
       timestamp: new Date(),
@@ -407,52 +389,82 @@ export class TestSuiteVerificationService extends EventEmitter {
     };
   }
 
-  private getJestVersion(): string {
-    try {
-      const packageJsonPath = path.join(this.projectRoot, 'node_modules', 'jest', 'package.json');
-      if (fs.existsSync(packageJsonPath)) {
-        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
-        return pkg.version;
-      }
-    } catch {
-      // Ignore
-    }
-    return 'unknown';
-  }
-
   private cleanup(): void {
     if (this.process) {
       this.process.removeAllListeners();
-      if (!this.process.killed) {
-        this.process.kill('SIGTERM');
-      }
       this.process = null;
     }
   }
 
-  async terminate(): Promise<void> {
+  kill(): void {
     if (this.process && !this.process.killed) {
       this.process.kill('SIGTERM');
-      
-      await new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => {
-          if (this.process && !this.process.killed) {
-            this.process.kill('SIGKILL');
-          }
-          resolve();
-        }, 5000);
-
-        this.process?.once('close', () => {
-          clearTimeout(timeout);
-          resolve();
-        });
-      });
+      setTimeout(() => {
+        if (this.process && !this.process.killed) {
+          this.process.kill('SIGKILL');
+        }
+      }, 5000);
     }
-  }
-
-  isRunning(): boolean {
-    return this.process !== null && !this.process.killed;
   }
 }
 
-export const testSuiteVerificationService = new TestSuiteVerificationService();
+async function cliHandler(): Promise<void> {
+  const args = process.argv.slice(2);
+  const projectRoot = args.find(arg => arg.startsWith('--project-root='))?.split('=')[1] || process.cwd();
+  const outputPath = args.find(arg => arg.startsWith('--output='))?.split('=')[1];
+  const help = args.includes('--help') || args.includes('-h');
+
+  if (help) {
+    console.log(`
+Test Suite Verification Service - CLI
+
+Usage:
+  npx ts-node src/services/testSuiteVerificationService.ts [options]
+
+Options:
+  --project-root=<path>   Project root directory (default: current working directory)
+  --output=<path>         Output JSON file path for benchmarks
+  --help, -h              Show this help message
+
+Examples:
+  npx ts-node src/services/testSuiteVerificationService.ts
+  npx ts-node src/services/testSuiteVerificationService.ts --project-root=/path/to/project --output=./benchmarks/verification.json
+`);
+    process.exit(0);
+  }
+
+  try {
+    console.log(`[Verification] Starting test suite verification in ${projectRoot}`);
+    const result = await TestSuiteVerificationService.runVerification(projectRoot, outputPath);
+    
+    console.log(`[Verification] Status: ${result.status.toUpperCase()}`);
+    console.log(`[Verification] Tests: ${result.benchmarks.passedTests}/${result.benchmarks.totalTests} passed (${result.benchmarks.passRate.toFixed(2)}%)`);
+    console.log(`[Verification] Duration: ${result.benchmarks.duration}ms`);
+    console.log(`[Verification] Coverage: ${result.benchmarks.coverage.statements}% statements, ${result.benchmarks.coverage.branches}% branches, ${result.benchmarks.coverage.functions}% functions, ${result.benchmarks.coverage.lines}% lines`);
+    
+    if (result.failures.length > 0) {
+      console.log(`[Verification] Failures: ${result.failures.length}`);
+      for (const failure of result.failures) {
+        console.error(`  - ${failure.testName} (${failure.file}): ${failure.message}`);
+      }
+    }
+
+    if (outputPath) {
+      console.log(`[Verification] Benchmarks written to ${outputPath}`);
+    }
+
+    process.exit(result.status === 'passed' ? 0 : 1);
+  } catch (error) {
+    console.error('[Verification] Fatal error:', error);
+    process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  cliHandler().catch((error) => {
+    console.error('[Verification] Unhandled error:', error);
+    process.exit(1);
+  });
+}
+
+export { cliHandler };
